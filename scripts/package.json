@@ -1,0 +1,21 @@
+{
+  "name": "keycloak-realm-manager",
+  "version": "1.0.0",
+  "description": "Declarative Keycloak realm management tool",
+  "main": "realm-manager.js",
+  "scripts": {
+    "test": "node realm-manager.js"
+  },
+  "keywords": [
+    "keycloak",
+    "realm",
+    "nixos",
+    "declarative"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@keycloak/keycloak-admin-client": "^25.0.0"
+  }
+}
+
