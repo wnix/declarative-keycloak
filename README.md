@@ -133,6 +133,10 @@ Default: `true`
 
 Whether to enable this realm.
 
+#### Client option: `serviceAccountsEnabled`
+
+On declarative clients, set `serviceAccountsEnabled = true` for OAuth2 **client credentials** (LLM agents, automation). After realm creation, assign roles to the service account user in the Admin Console and use the client secret for token requests.
+
 #### `services.keycloak-realms.realms.<name>.mutableConfig`
 
 Type: `boolean`

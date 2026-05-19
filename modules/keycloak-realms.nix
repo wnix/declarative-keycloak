@@ -73,7 +73,7 @@ let
         directAccessGrantsEnabled = clientCfg.directAccessGrantsEnabled;
         standardFlowEnabled = clientCfg.standardFlowEnabled;
         implicitFlowEnabled = false;
-        serviceAccountsEnabled = false;
+        serviceAccountsEnabled = clientCfg.serviceAccountsEnabled;
         inherit redirectUris webOrigins;
         protocol = "openid-connect";
         attributes = {
@@ -462,6 +462,15 @@ in {
                         type = types.str;
                         default = "/";
                         description = mdDoc "Default URL to use when the auth server needs to redirect/link back to the client";
+                      };
+
+                      serviceAccountsEnabled = mkOption {
+                        type = types.bool;
+                        default = false;
+                        description = mdDoc ''
+                          Enable OAuth2 client credentials for service accounts (LLM agents, automation).
+                          Assign roles to the service account user after realm creation.
+                        '';
                       };
                     };
                   }));
