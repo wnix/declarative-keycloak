@@ -135,54 +135,80 @@ let
   };
 
   # Helper to create a realm service configuration
-  mkRealmService = name: realmCfg: {
+  mkRealmService = name: realmCfg:
+    let
+      realmFile = getRealmFile name realmCfg;
+      stateDir  = cfg.stateDir;
+
+      # Script for mutableConfig = true (default): create once, never update
+      execStartMutable = pkgs.writeShellScript "keycloak-realm-${name}-mutable" ''
+        export KEYCLOAK_ADMIN_PASSWORD=$(cat $CREDENTIALS_DIRECTORY/admin-password)
+        ${realm-manager}/bin/realm-manager create ${escapeShellArg realmCfg.realmName} ${realmFile}
+        touch ${stateDir}/${name}.created
+      '';
+
+      # Script for mutableConfig = false: apply when Nix store path changed
+      execStartImmutable = pkgs.writeShellScript "keycloak-realm-${name}-immutable" ''
+        export KEYCLOAK_ADMIN_PASSWORD=$(cat $CREDENTIALS_DIRECTORY/admin-password)
+
+        CURRENT_PATH=${realmFile}
+        LAST_APPLIED_FILE=${stateDir}/${name}.last-applied-path
+
+        if [ -f "$LAST_APPLIED_FILE" ] && [ "$(cat "$LAST_APPLIED_FILE")" = "$CURRENT_PATH" ]; then
+          echo "Realm ${name}: config unchanged ($CURRENT_PATH), skipping."
+          exit 0
+        fi
+
+        echo "Realm ${name}: config changed, applying..."
+        ${realm-manager}/bin/realm-manager update-or-create ${escapeShellArg realmCfg.realmName} ${realmFile}
+        echo "$CURRENT_PATH" > "$LAST_APPLIED_FILE"
+        touch ${stateDir}/${name}.created
+      '';
+    in {
     description = "Create Keycloak realm: ${name}";
     after = [ "keycloak.service" ];
     wants = [ "keycloak.service" ];
     wantedBy = [ "multi-user.target" ];
-    
-    # Only run if the marker file doesn't exist
-    unitConfig = {
-      ConditionPathExists = "!${config.services.keycloak-realms.stateDir}/${name}.created";
+
+    # For mutableConfig = true: only run if the marker file doesn't exist.
+    # For mutableConfig = false: always run (change detection is inside the script).
+    unitConfig = mkIf realmCfg.mutableConfig {
+      ConditionPathExists = "!${stateDir}/${name}.created";
     };
+
+    # Restart the service when the unit changes (i.e. when the Nix store path
+    # of the realm JSON changes), so mutableConfig = false realms are re-applied
+    # automatically on nixos-rebuild switch.
+    restartIfChanged = !realmCfg.mutableConfig;
 
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      
+
       # Exit code 2 means realm already exists, which is success for us
       SuccessExitStatus = "0 2";
-      
+
       # Security hardening
       DynamicUser = false;
       NoNewPrivileges = true;
       PrivateTmp = true;
       ProtectSystem = "strict";
       ProtectHome = true;
-      ReadWritePaths = [ cfg.stateDir ];
-      
+      ReadWritePaths = [ stateDir ];
+
       # State directory for marker files
-      StateDirectory = baseNameOf cfg.stateDir;
-      
+      StateDirectory = baseNameOf stateDir;
+
       # Load the admin password from file
       LoadCredential = [ "admin-password:${cfg.adminPasswordFile}" ];
-      
+
       # Environment variables for realm-manager
       Environment = [
         "KEYCLOAK_URL=${cfg.keycloakUrl}"
         "KEYCLOAK_ADMIN_USER=${cfg.adminUser}"
       ];
-      
-      # The actual command
-      ExecStart = let
-        realmFile = getRealmFile name realmCfg;
-      in ''
-        ${pkgs.bash}/bin/bash -c ' \
-          export KEYCLOAK_ADMIN_PASSWORD=$(cat $CREDENTIALS_DIRECTORY/admin-password) && \
-          ${realm-manager}/bin/realm-manager create ${escapeShellArg realmCfg.realmName} ${realmFile} && \
-          touch ${cfg.stateDir}/${name}.created \
-        '
-      '';
+
+      ExecStart = if realmCfg.mutableConfig then "${execStartMutable}" else "${execStartImmutable}";
     };
   };
 
@@ -285,6 +311,26 @@ in {
             default = true;
             description = mdDoc ''
               Whether to enable this realm.
+            '';
+          };
+
+          mutableConfig = mkOption {
+            type = types.bool;
+            default = false;
+            description = mdDoc ''
+              When false (default), the realm configuration is kept
+              congruent with the Nix declaration: on every
+              `nixos-rebuild switch`, the current Nix store path of the
+              realm JSON is compared to the last applied path. If the
+              config changed, the realm is automatically replaced.
+
+              When true, the realm is created once and never
+              automatically updated — imperative changes via the Keycloak
+              UI or CLI are preserved (drift allowed). Manual replacement
+              via `systemctl start keycloak-replace-realm@<name>` is
+              still available.
+
+              Mirrors the semantics of `users.mutableUsers`.
             '';
           };
 

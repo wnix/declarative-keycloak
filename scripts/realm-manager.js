@@ -10,9 +10,10 @@
  *   realm-manager <action> <realm-name> <realm-file>
  * 
  * Actions:
- *   check   - Check if a realm exists
- *   create  - Create realm only if it doesn't exist
- *   replace - Delete and recreate realm (for manual replacement)
+ *   check            - Check if a realm exists
+ *   create           - Create realm only if it doesn't exist
+ *   replace          - Delete and recreate realm (for manual replacement)
+ *   update-or-create - Replace if exists, create if not (used by mutableConfig = false)
  * 
  * Environment Variables:
  *   KEYCLOAK_URL          - Keycloak base URL (required)
@@ -280,6 +281,31 @@ async function handleCreate(client, realmName, realmFile) {
 }
 
 /**
+ * Handle the 'update-or-create' action (replace if exists, create if not)
+ * Used by mutableConfig = false realms to apply declarative config changes.
+ */
+async function handleUpdateOrCreate(client, realmName, realmFile) {
+  console.log(`Applying realm ${realmName} (replace if exists, create if not)`);
+
+  const realmData = await readRealmFile(realmFile);
+
+  if (realmData.realm !== realmName) {
+    console.warn(`Warning: Realm name in file (${realmData.realm}) doesn't match specified name (${realmName})`);
+    console.log(`Using realm name from file: ${realmData.realm}`);
+  }
+
+  const exists = await realmExists(client, realmName);
+
+  if (exists) {
+    await replaceRealm(client, realmName, realmData);
+  } else {
+    await createRealm(client, realmData);
+  }
+
+  return EXIT_SUCCESS;
+}
+
+/**
  * Handle the 'replace' action (manual realm replacement)
  */
 async function handleReplace(client, realmName, realmFile) {
@@ -309,7 +335,7 @@ async function main() {
   
   if (args.length < 1) {
     console.error('Usage: realm-manager <action> <realm-name> <realm-file>');
-    console.error('Actions: check, create, replace');
+    console.error('Actions: check, create, replace, update-or-create');
     process.exit(EXIT_ERROR);
   }
   
@@ -323,8 +349,8 @@ async function main() {
     process.exit(EXIT_ERROR);
   }
   
-  if ((action === 'create' || action === 'replace') && (!realmName || !realmFile)) {
-    console.error('Error: realm-name and realm-file are required for create/replace actions');
+  if ((action === 'create' || action === 'replace' || action === 'update-or-create') && (!realmName || !realmFile)) {
+    console.error('Error: realm-name and realm-file are required for create/replace/update-or-create actions');
     process.exit(EXIT_ERROR);
   }
   
@@ -356,10 +382,14 @@ async function main() {
       case 'replace':
         exitCode = await handleReplace(client, realmName, realmFile);
         break;
-        
+
+      case 'update-or-create':
+        exitCode = await handleUpdateOrCreate(client, realmName, realmFile);
+        break;
+
       default:
         console.error(`Unknown action: ${action}`);
-        console.error('Valid actions: check, create, replace');
+        console.error('Valid actions: check, create, replace, update-or-create');
         exitCode = EXIT_ERROR;
     }
     

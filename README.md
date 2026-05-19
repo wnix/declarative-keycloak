@@ -4,11 +4,12 @@ A NixOS module for declarative management of Keycloak realms with a focus on saf
 
 ## Features
 
-- **Idempotent Realm Creation**: Realms are only created if they don't exist, preventing accidental overwrites
+- **Declarative by Default**: Realm configuration is kept congruent with Nix — changes are applied automatically on `nixos-rebuild switch`
+- **Safe Change Detection**: Uses Nix store path hashing to detect changes with zero runtime overhead — no diff, no API polling
+- **Opt-in Drift**: Set `mutableConfig = true` on a realm to allow imperative changes via the Keycloak UI or CLI to persist
 - **Manual Realm Replacement**: Explicit mechanism for replacing realm configurations when needed (e.g., promoting from dev to prod)
 - **Clean JavaScript Implementation**: Modern Node.js code using the official Keycloak Admin Client
 - **Secrets Integration**: Designed to work seamlessly with sops-nix and systemd credential loading
-- **Declarative Configuration**: Define realms in your NixOS configuration
 - **Comprehensive Testing**: Includes a test container for validation
 
 ## Quick Start
@@ -131,6 +132,18 @@ Type: `boolean`
 Default: `true`
 
 Whether to enable this realm.
+
+#### `services.keycloak-realms.realms.<name>.mutableConfig`
+
+Type: `boolean`
+
+Default: `false`
+
+When `false` (default), the realm is kept congruent with the Nix declaration. On every `nixos-rebuild switch`, the module compares the current Nix store path of the realm JSON against the last applied path. If it changed, the realm is automatically replaced in Keycloak.
+
+When `true`, the realm is created once and never automatically updated. Imperative changes via the Keycloak UI or CLI are preserved (drift allowed). Manual replacement via `systemctl start keycloak-replace-realm@<name>` is still available.
+
+This mirrors the semantics of `users.mutableUsers`.
 
 #### `services.keycloak-realms.realms.<name>.realmFile`
 
@@ -279,9 +292,7 @@ services.keycloak-realms = {
 
 ## Manual Realm Replacement
 
-Realms are **never** automatically updated once they exist. This is by design to prevent accidental data loss.
-
-To manually replace a realm configuration (e.g., when promoting changes from dev to prod):
+With `mutableConfig = true`, realms are never automatically updated. To manually replace a realm configuration (e.g., when promoting changes from dev to prod):
 
 ```bash
 # Replace the 'myapp' realm
@@ -329,26 +340,36 @@ kcadm.sh get realms/my-realm > my-realm.json
 
 ## How It Works
 
-### Automatic Realm Creation
+### Declarative mode (`mutableConfig = false`, default)
 
-1. On system boot, a systemd service (`keycloak-realm-<name>.service`) starts for each defined realm
-2. The service checks if a marker file exists in `/var/lib/keycloak-realms/<name>.created`
+1. On every `nixos-rebuild switch`, the systemd service (`keycloak-realm-<name>.service`) activates
+2. The service compares the current Nix store path of the realm JSON against the path stored in `/var/lib/keycloak-realms/<name>.last-applied-path`
+3. If unchanged: logs "config unchanged, skipping" and exits immediately
+4. If changed (or first run):
+   - Waits for Keycloak to be ready
+   - Connects to Keycloak Admin API
+   - Replaces the realm if it exists, creates it if not
+   - Writes the new store path to `<name>.last-applied-path`
+   - Creates the `<name>.created` marker
+
+The Nix store path itself encodes a content hash — it changes if and only if the realm JSON changes. No runtime hashing or diffing required.
+
+### Mutable mode (`mutableConfig = true`)
+
+1. On boot, the systemd service starts for each defined realm
+2. The service checks if `/var/lib/keycloak-realms/<name>.created` exists
 3. If the marker doesn't exist:
-   - Wait for Keycloak to be ready
-   - Connect to Keycloak Admin API
-   - Check if the realm exists
-   - If not, create it from the JSON file
-   - Create the marker file
-4. If the marker exists, the service is skipped (systemd `ConditionPathExists`)
+   - Waits for Keycloak to be ready
+   - Creates the realm from the JSON file
+   - Creates the marker file
+4. If the marker exists, the service is skipped (systemd `ConditionPathExists`) — imperative changes are preserved
 
 ### Manual Replacement
 
 1. You trigger the replacement: `systemctl start keycloak-replace-realm@<name>`
 2. The template service looks up the realm configuration
-3. It connects to Keycloak Admin API
-4. Deletes the existing realm
-5. Recreates it from the JSON file
-6. The marker file is **not** used for replacement (always runs when triggered)
+3. Connects to Keycloak Admin API, deletes the existing realm, recreates it from the JSON file
+4. The marker file is **not** used (always runs when triggered)
 
 ### Security
 
@@ -419,16 +440,22 @@ Common issues:
 
 ### Reset Everything
 
-To force recreation of a realm:
+To force recreation of a realm (declarative mode, `mutableConfig = false`):
 
 ```bash
-# Stop the service
-sudo systemctl stop keycloak-realm-<name>.service
-
-# Remove the marker file
+# Remove the state files so the service re-applies on next activation
 sudo rm /var/lib/keycloak-realms/<name>.created
+sudo rm /var/lib/keycloak-realms/<name>.last-applied-path
 
-# Start the service again
+# Trigger immediately
+sudo systemctl restart keycloak-realm-<name>.service
+```
+
+For mutable mode (`mutableConfig = true`):
+
+```bash
+sudo systemctl stop keycloak-realm-<name>.service
+sudo rm /var/lib/keycloak-realms/<name>.created
 sudo systemctl start keycloak-realm-<name>.service
 ```
 
@@ -440,13 +467,17 @@ Run the realm-manager script manually:
 # Check if a realm exists
 realm-manager check my-realm
 
-# Create a realm
+# Create a realm (only if it doesn't exist)
 KEYCLOAK_ADMIN_PASSWORD=admin \
 realm-manager create my-realm /path/to/realm.json
 
-# Replace a realm
+# Replace a realm (must already exist)
 KEYCLOAK_ADMIN_PASSWORD=admin \
 realm-manager replace my-realm /path/to/realm.json
+
+# Replace if exists, create if not (used internally by mutableConfig = false)
+KEYCLOAK_ADMIN_PASSWORD=admin \
+realm-manager update-or-create my-realm /path/to/realm.json
 ```
 
 ## Development
@@ -523,15 +554,19 @@ Refer to the example realms in `example-realms/` for inspiration.
 
 ### From Manual Keycloak Management
 
+If you already have realms in Keycloak and want to bring them under Nix management without recreating them:
+
 1. Export your existing realms from Keycloak
 2. Save them as JSON files in your NixOS configuration
-3. Add the keycloak-realms module to your configuration
-4. **Do not** apply yet - this will cause the module to think realms need to be created
-5. After applying, manually create the marker files:
-   ```bash
-   touch /var/lib/keycloak-realms/<name>.created
+3. Add the keycloak-realms module with `mutableConfig = true` on each realm:
+   ```nix
+   realms.myapp = {
+     mutableConfig = true;
+     realmFile = ./realms/myapp-realm.json;
+   };
    ```
-6. Now the module will skip creation and only manage new realms
+4. Apply the configuration — the module will skip creation (marker file absent) and create the marker
+5. Once you're ready for fully declarative management, switch to `mutableConfig = false`
 
 ### To Another Server
 
@@ -545,7 +580,6 @@ Refer to the example realms in `example-realms/` for inspiration.
 
 Contributions are welcome! Areas for improvement:
 
-- [ ] Support for partial realm updates (not just full replacement)
 - [ ] Dry-run mode for testing configurations
 - [ ] Better validation of realm JSON files
 - [ ] Integration tests
